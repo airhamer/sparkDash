@@ -35,8 +35,8 @@
     {
       "id": "gx10-102c",
       "name": "GX10 Worker (102c)",
-      "endpoint": "192.168.50.102:30091",
-      "lanIp": "192.168.50.102",
+      "endpoint": "192.168.50.118:30091",
+      "lanIp": "192.168.50.118",
       "role": "worker",
       "rank": 1,
       "groupId": "tp2",
@@ -67,8 +67,8 @@
     {
       "id": "gx10-25ed",
       "name": "GX10 Worker (25ed)",
-      "endpoint": "192.168.50.254:30091",
-      "lanIp": "192.168.50.254",
+      "endpoint": "192.168.50.46:30091",
+      "lanIp": "192.168.50.46",
       "role": "worker",
       "rank": 2,
       "groupId": "tp2",

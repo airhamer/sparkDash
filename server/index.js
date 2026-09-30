@@ -46,6 +46,11 @@ import {
 } from "./energy/FleetEnergyRuntime.js";
 import { testSparkConnectivity } from "./connectivity.js";
 import { inspectStartupPreflight, logStartupPreflight } from "./startupPreflight.js";
+import { randomUUID } from "node:crypto";
+import { loadNodes, listNodes, addNode, updateNode, removeNode } from "./fleet/registry.js";
+import { createFleetConnection } from "./fleet/connection.js";
+import { buildTopology } from "./fleet/topology.js";
+import { aggregateRequests } from "./fleet/aggregate.js";
 
 dotenv.config();
 
@@ -307,6 +312,90 @@ const fleetEnergyRuntime = createFleetEnergyRuntime({
   monitors,
 });
 
+// ─── Fleet (node-agent) layer ────────────────────────────
+// Separate from the SSH-based Spark monitors above: each fleet node runs
+// sparkdash-node-agent (default :30091) and the dashboard polls its
+// /telemetry endpoint over plain HTTP. Registry: config/nodes.json
+// (missing file → empty fleet, not an error — mirrors SparkRegistry).
+let fleetConnection = createFleetConnection(loadNodes());
+
+/** Minimal NodeAgentSnapshot for a registered node that has never polled successfully. */
+function emptyNodeSnapshot(rec) {
+  return {
+    nodeId: rec.id,
+    nodeName: rec.name,
+    lanIp: rec.lanIp,
+    agentVersion: null,
+    online: false,
+    uptimeSeconds: null,
+    gpu: null,
+    cpu: null,
+    mem: null,
+    disk: [],
+    net: [],
+    containers: [],
+    versions: [],
+    services: [],
+    memory: null,
+    requests: null,
+    topology: null,
+    polledAt: 0,
+  };
+}
+
+/**
+ * Assemble the FleetSnapshot (shared/types.ts) from the registry + cached
+ * node-agent snapshots. A node that has never polled successfully degrades
+ * to an online:false stub so the UI can render every registered node.
+ */
+function buildFleetSnapshot() {
+  const nodes = listNodes();
+  const cached = fleetConnection.getAllSnapshots();
+  const nodeSnaps = nodes.map((rec) => {
+    const snap = fleetConnection.getSnapshot(rec.id) ?? emptyNodeSnapshot(rec);
+    return {
+      ...snap,
+      nodeName: snap.nodeName || rec.name,
+      lanIp: snap.lanIp || rec.lanIp,
+      online: fleetConnection.isOnline(rec.id),
+    };
+  });
+  const requests = aggregateRequests(cached);
+  const byNode = {};
+  let totalMB = 0;
+  let usedMB = 0;
+  let freeMB = 0;
+  for (const rec of nodes) {
+    const snap = cached[rec.id];
+    if (!snap || !snap.memory) continue;
+    byNode[rec.id] = snap.memory;
+    totalMB += snap.memory.totalMB || 0;
+    usedMB += snap.memory.usedMB || 0;
+    freeMB += snap.memory.freeMB || 0;
+  }
+  return {
+    nodes: nodeSnaps,
+    topology: buildTopology(nodes),
+    requests,
+    memory: { totalMB, usedMB, freeMB, byNode },
+    polledAt: Date.now(),
+  };
+}
+
+/**
+ * Rebuild the poller after a registry mutation (node add/update/delete).
+ * The connection manager is immutable after creation, so swap in a fresh
+ * one; start/stop are both idempotent.
+ */
+function restartFleetConnection() {
+  const prev = fleetConnection;
+  fleetConnection = createFleetConnection(loadNodes());
+  void fleetConnection
+    .start()
+    .catch((err) => console.error("[fleet] poller start failed:", err.message));
+  void prev.stop().catch(() => {});
+}
+
 // ─── Express app ─────────────────────────────────────────
 const app = express();
 const server = createServer(app);
@@ -470,6 +559,90 @@ app.put("/api/sparks/order", (req, res) => {
     res.json({ success: true, sparks });
   } catch (err) {
     res.status(400).json({ error: err.message });
+  }
+});
+
+// ─── Fleet (node-agent) API ────────────────────────────────
+// Registry CRUD (persisted to config/nodes.json) + aggregated fleet snapshot.
+// The fleet layer is independent of the SSH-based Spark monitors above: both
+// coexist, each with its own registry and poller.
+
+app.get("/api/fleet", (_req, res) => {
+  res.json(buildFleetSnapshot());
+});
+
+app.get("/api/fleet/nodes", (_req, res) => {
+  res.json({ nodes: listNodes() });
+});
+
+app.post("/api/fleet/nodes", (req, res) => {
+  try {
+    const node = addNode(req.body || {});
+    restartFleetConnection();
+    res.json({ success: true, node });
+  } catch (err) {
+    res.status(err.status || 400).json({ error: err.message });
+  }
+});
+
+app.put("/api/fleet/nodes/:id", (req, res) => {
+  try {
+    const node = updateNode(req.params.id, req.body || {});
+    restartFleetConnection();
+    res.json({ success: true, node });
+  } catch (err) {
+    res.status(err.status || 400).json({ error: err.message });
+  }
+});
+
+app.delete("/api/fleet/nodes/:id", (req, res) => {
+  try {
+    const removed = removeNode(req.params.id);
+    if (!removed) return res.status(404).json({ error: "Node not found" });
+    restartFleetConnection();
+    res.json({ success: true, removed });
+  } catch (err) {
+    res.status(err.status || 400).json({ error: err.message });
+  }
+});
+
+/**
+ * Proxy a service action (start/stop/restart/switch) to the node's agent
+ * POST /actions. The deployed agent build (0.1.0) is telemetry-only (GET),
+ * so this surfaces 501 until an agent build that ships the actions endpoint
+ * is deployed — the proxy itself then needs no changes.
+ */
+app.post("/api/fleet/nodes/:id/actions", async (req, res) => {
+  const rec = listNodes().find((n) => n.id === req.params.id);
+  if (!rec) return res.status(404).json({ error: "Node not found" });
+  const endpoint = (rec.endpoint || `${rec.lanIp}:${rec.agentPort}`).replace(/\/+$/, "");
+  try {
+    const upstream = await fetch(`http://${endpoint}/actions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        actionId: randomUUID(),
+        idempotent: true,
+        timeoutMs: null,
+        ...(req.body || {}),
+      }),
+      signal: AbortSignal.timeout(60_000),
+    });
+    const body = await upstream.json().catch(() => null);
+    if (upstream.status === 405) {
+      return res.status(501).json({
+        error:
+          "The node agent on this node is a telemetry-only build (no /actions endpoint yet). Service start/stop is available once the agent actions build is deployed.",
+      });
+    }
+    if (!upstream.ok) {
+      return res.status(502).json({
+        error: body?.error || `Node agent responded ${upstream.status}`,
+      });
+    }
+    res.json(body ?? { ok: true });
+  } catch (err) {
+    res.status(502).json({ error: `Node agent unreachable: ${err.message}` });
   }
 });
 
@@ -1615,6 +1788,8 @@ const indexHtml = path.join(distDir, "index.html");
 app.use(express.static(distDir));
 
 // ─── SPA fallback (Express v5 wildcard) ───────────────────
+// Note: sendFile MUST use the root option here — with express 5.2 / send 1.2,
+// a bare absolute path silently 404s even when the file exists.
 app.get("*splat", (_req, res) => {
   if (!fs.existsSync(indexHtml)) {
     return res
@@ -1622,7 +1797,7 @@ app.get("*splat", (_req, res) => {
       .type("text")
       .send("Frontend not built. Run `npm run build` or use `npm run dev`.");
   }
-  res.sendFile(indexHtml);
+  res.sendFile("index.html", { root: distDir });
 });
 
 // ─── WebSocket ──────────────────────────────────────────
@@ -1734,6 +1909,9 @@ if (!startupPreflight.fatal) {
     }
     startAllMonitors();
     fleetEnergyRuntime.start();
+    void fleetConnection
+      .start()
+      .catch((err) => console.error("[fleet] initial poll failed:", err.message));
   });
 } else {
   process.exitCode = 1;
@@ -1776,6 +1954,11 @@ async function shutdown(signal) {
     monitors.clear();
   } catch (err) {
     console.error("[sparkDash] error during shutdown:", err.message);
+  }
+  try {
+    await fleetConnection.stop();
+  } catch (err) {
+    console.error("[sparkDash] fleet stop error:", err.message);
   }
   // Tell WS clients the server is going away, then close the server.
   try {

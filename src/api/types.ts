@@ -906,3 +906,23 @@ export interface ShowcaseStartResponse {
   sessionId: string;
   status: "running";
 }
+
+// ─── Fleet (node-agent) — seam types re-exported from shared/types.ts ──────
+// The node-agent fleet layer shares its seam types with the agent and the
+// dashboard server; the frontend consumes them through this module. Names
+// that collide with the Spark-side types above (GpuMetrics, CpuMetrics, …)
+// stay shared-only and are imported directly from shared/types where needed.
+export type {
+  FleetSnapshot,
+  NodeAgentSnapshot,
+  MemoryBudget,
+  MakeRoomEntry,
+  MemoryService,
+  RequestStat,
+  RequestStats,
+  RoceLink,
+  ServiceInstance,
+  TopologyInfo,
+  VersionInfo,
+  ContainerInfo,
+} from "../../shared/types";

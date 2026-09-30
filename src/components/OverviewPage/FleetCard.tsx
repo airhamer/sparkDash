@@ -30,6 +30,8 @@ export interface FleetCardProps {
   topology: TopologyInfo | null;
   memory: MemoryBudget | null;
   polledAt: number;
+  /** When set, the card is clickable and opens the node detail view. */
+  onSelect?: (nodeId: string) => void;
 }
 
 /**
@@ -118,6 +120,7 @@ export function FleetCard(props: FleetCardProps) {
     requests,
     memory,
     polledAt,
+    onSelect,
   } = props;
 
   const usage = gpu?.usage ?? 0;
@@ -150,7 +153,22 @@ export function FleetCard(props: FleetCardProps) {
   return (
     <div
       aria-label={`Fleet node ${nodeName}`}
-      className="overview-card flex flex-col"
+      className={`overview-card flex flex-col ${
+        onSelect ? "cursor-pointer transition-colors hover:border-accent/60" : ""
+      }`}
+      role={onSelect ? "button" : undefined}
+      tabIndex={onSelect ? 0 : undefined}
+      onClick={onSelect ? () => onSelect(nodeId) : undefined}
+      onKeyDown={
+        onSelect
+          ? (e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                onSelect(nodeId);
+              }
+            }
+          : undefined
+      }
       style={{
         padding: "var(--density-card-pad)",
         gap: "var(--density-card-gap)",

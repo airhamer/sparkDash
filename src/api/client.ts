@@ -2,6 +2,7 @@ import type {
   DecodeBenchJob,
   DecodeBenchListResponse,
   FleetEnergy,
+  FleetSnapshot,
   HermesBatchUpdateResponse,
   HermesUpdatesResponse,
   LlmMetrics,
@@ -440,5 +441,35 @@ export function updateSettings(patch: Partial<Settings>): Promise<Settings> {
   return apiFetch("/api/settings", {
     method: "PUT",
     body: JSON.stringify(patch),
+  });
+}
+
+// ─── Fleet (node-agent) ─────────────────────────────────
+/** Aggregated fleet snapshot: nodes + topology + requests + memory. */
+export function fetchFleet(): Promise<FleetSnapshot> {
+  return apiFetch("/api/fleet");
+}
+
+/** One service action proxied to a node's agent (POST /actions). */
+export interface NodeActionRequest {
+  type: "start" | "stop" | "restart" | "switch";
+  serviceName: string;
+  modelId?: string | null;
+}
+
+export interface NodeActionResponse {
+  ok: boolean;
+  status?: string;
+  message?: string;
+  error?: string;
+}
+
+export function sendNodeAction(
+  nodeId: string,
+  body: NodeActionRequest
+): Promise<NodeActionResponse> {
+  return apiFetch(`/api/fleet/nodes/${encodeURIComponent(nodeId)}/actions`, {
+    method: "POST",
+    body: JSON.stringify(body),
   });
 }

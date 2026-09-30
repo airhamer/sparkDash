@@ -2,7 +2,6 @@ import { useEffect, useCallback, useRef, useState } from "react";
 import { OVERVIEW_ID } from "../constants";
 
 export type RouteMode = "app" | "showcase";
-
 export interface AppRoute {
   mode: RouteMode;
   /** Spark id for showcase mode */
@@ -91,4 +90,78 @@ export function useRoute(
   );
 
   return navigate;
+}
+
+// ─── Fleet views (node-agent layer) ────────────────────────────────────────
+//
+// URL scheme (independent of the spark tab bar):
+//   /fleet                → fleet overview
+//   /topology             → topology / RoCE diagram
+//   /node/:id             → node detail
+//   /node/:id/services    → service manager (start/stop/switch)
+//   /node/:id/requests    → requests visualization
+
+export type FleetView =
+  | { page: "fleet" }
+  | { page: "topology" }
+  | { page: "node"; nodeId: string }
+  | { page: "node-services"; nodeId: string }
+  | { page: "node-requests"; nodeId: string };
+
+export function fleetViewToPath(v: FleetView): string {
+  switch (v.page) {
+    case "fleet":
+      return "/fleet";
+    case "topology":
+      return "/topology";
+    case "node":
+      return `/node/${encodeURIComponent(v.nodeId)}`;
+    case "node-services":
+      return `/node/${encodeURIComponent(v.nodeId)}/services`;
+    case "node-requests":
+      return `/node/${encodeURIComponent(v.nodeId)}/requests`;
+  }
+}
+
+export function parseFleetPath(pathname: string): FleetView | null {
+  if (pathname === "/fleet") return { page: "fleet" };
+  if (pathname === "/topology") return { page: "topology" };
+  const m = pathname.match(/^\/node\/([^/]+)(?:\/(services|requests))?$/);
+  if (!m) return null;
+  const nodeId = decodeURIComponent(m[1]);
+  if (m[2] === "services") return { page: "node-services", nodeId };
+  if (m[2] === "requests") return { page: "node-requests", nodeId };
+  return { page: "node", nodeId };
+}
+
+/**
+ * useFleetRoute — router for the fleet views. `view: null` means the user is
+ * NOT in a fleet view (spark overview / spark detail instead). Back/forward
+ * work via popstate, like useRoute.
+ *
+ * `navigate(null)` leaves the fleet views using history.replaceState so the
+ * URL is cleaned without stacking a redundant "/" entry.
+ */
+export function useFleetRoute() {
+  const [view, setView] = useState<FleetView | null>(() =>
+    parseFleetPath(window.location.pathname)
+  );
+
+  useEffect(() => {
+    const handler = () => setView(parseFleetPath(window.location.pathname));
+    window.addEventListener("popstate", handler);
+    return () => window.removeEventListener("popstate", handler);
+  }, []);
+
+  const navigate = useCallback((v: FleetView | null) => {
+    if (v == null) {
+      window.history.replaceState(null, "/");
+      setView(null);
+      return;
+    }
+    window.history.pushState(null, "/", fleetViewToPath(v));
+    setView(v);
+  }, []);
+
+  return { view, navigate };
 }

@@ -34,6 +34,7 @@ It also supports **non-Spark units**: any Linux machine with an NVIDIA GPU (e.g.
 - [ComfyUI monitoring](#comfyui-monitoring)
 - [Hermes Agent monitoring](#hermes-agent-monitoring)
 - [Tailnet monitoring](#tailnet-monitoring)
+- [Fleet view (node-agent)](#fleet-view-node-agent)
 - [Full changelog](./CHANGELOG.md)
 - [Quick start](#quick-start)
 - [Architecture](#architecture)
@@ -229,6 +230,20 @@ Asked of **each node about itself**. Peer state is never the verdict. The probe 
 | `tailscaleMonitoring` | `false` | Run `tailscale status --json` and show the Tailnet card |
 
 Env (optional): `POLL_INTERVAL_TAILSCALE` (default `30000`), `TAILSCALE_PROBE_TIMEOUT_MS` (default `8000`).
+
+---
+
+## Fleet view (node-agent)
+
+The dashboard can also aggregate a **node-agent fleet**: each DGX Spark (or any node) runs the lightweight `sparkdash-node-agent` (default port `30091`, zero dependencies) and the dashboard polls its `/telemetry` endpoint over plain HTTP — no SSH. Fleet nodes are registered in `config/nodes.json` (start from the tracked `config/nodes.example.json`):
+
+- `GET /api/fleet` — aggregated fleet snapshot (nodes, topology, requests, memory)
+- `POST / PUT / DELETE /api/fleet/nodes[/:id]` — registry CRUD, persisted to `config/nodes.json`
+- `POST /api/fleet/nodes/:id/actions` — service start/stop/switch proxied to the node agent (requires an agent build that ships the `POST /actions` endpoint; telemetry-only agent builds get a clear 501 back)
+
+New UI views (reachable from the header tabs): `/fleet` (fleet overview), `/topology` (RoCE topology diagram), `/node/:id` (node detail), `/node/:id/services` (service manager), `/node/:id/requests` (requests visualization).
+
+The node agent is installed on each Spark with `deploy/install-node-agent.sh` (Docker: `deploy/Dockerfile.node-agent`). The fleet layer is fully independent of the SSH-based Spark monitors above — both coexist.
 
 ---
 

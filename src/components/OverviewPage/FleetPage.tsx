@@ -24,6 +24,8 @@ export interface FleetPageProps {
     freeMB: number;
     byNode: Record<string, MemoryBudget>;
   };
+  /** When set, node cards become clickable and open the node detail view. */
+  onSelectNode?: (nodeId: string) => void;
 }
 
 function formatMb(mb: number): string {
@@ -63,7 +65,7 @@ function sumRequests(byMachine: Record<string, RequestStat[]>) {
 /**
  * Fleet overview page: summary strip + one FleetCard per node.
  */
-export function FleetPage({ nodes, topology, requests, memory }: FleetPageProps) {
+export function FleetPage({ nodes, topology, requests, memory, onSelectNode }: FleetPageProps) {
   const onlineCount = nodes.filter((n) => n.online).length;
   const offlineCount = nodes.length - onlineCount;
   const reqs = sumRequests(requests.byMachine);
@@ -159,6 +161,7 @@ export function FleetPage({ nodes, topology, requests, memory }: FleetPageProps)
                 topology={node.topology}
                 memory={node.memory}
                 polledAt={node.polledAt}
+                onSelect={onSelectNode}
               />
             );
           })}

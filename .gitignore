@@ -2,6 +2,7 @@ node_modules/
 dist/
 .env
 sparks.json
+config/nodes.json
 config/sparks-secrets.json
 config/.secrets-key
 config/bench-history.json
