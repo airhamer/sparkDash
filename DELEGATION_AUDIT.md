@@ -151,6 +151,11 @@ need to be wired. This is expected; the seam contract (shared/types.ts) ensures 
    - Batch 1B: recipe catalog + memory budgeting + service registry
    - Batch 2A: docker actions + audit log
    - Batch 2B: systemd actions + LLM switch
+   - Batch 2C: action wiring — `agent/actions/dispatch.js` (ActionRequest → action
+     layer via the recipe catalog) + `http.js` `POST /actions` / `GET /audit`
+     + snapshot enrichment (`services`/`memory`/`requests` joined from the
+     catalog into `NodeAgentSnapshot`) + LLM probe auth tokens
+     (`LLM_AUTH_TOKENS`). Agent version 0.2.0.
    - Batch 5A: media catalog
 
 2. **Dashboard server owns all fleet-wide view + low-frequency aggregation + fleet actions.**

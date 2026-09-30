@@ -10,6 +10,8 @@
  *   - Batch 1B: agent/catalog/ (recipes.js, memory.js, services.js) — LANDED
  *   - Batch 2A: agent/actions/docker.js + agent/actions/audit.js
  *   - Batch 2B: agent/actions/systemd.js + agent/actions/llm-switch.js
+ *   - Batch 2C: agent/actions/dispatch.js + http.js POST /actions + GET /audit,
+ *     snapshot enrichment (services/memory/requests), LLM probe auth tokens
  *   - Batch 5A: agent/catalog/media.js
  *
  * Style: Node.js ESM, plain JS (JSDoc types), no build step. Mirrors sparkDash
@@ -24,6 +26,11 @@
  *   NODE_LAN_IP       — node LAN IP (default: first non-loopback IPv4)
  *   LLM_PORTS         — comma-separated LLM server ports to probe (default "8080")
  *   NODE_COMFY_PORT   — ComfyUI port (default 8188; 0 = no ComfyUI probe)
+ *   LLM_AUTH_TOKENS   — "port:token,port:token" bearer tokens for LLM servers
+ *                       that gate their info endpoints behind an api-key
+ *                       (sglang --api-key, vllm --api-key); empty = no auth
+ *   NODE_AGENT_AUDIT_PATH — audit log path (default: <agent>/config/audit.log,
+ *                       inside the mounted config volume)
  *   RECIPES_PATH      — path to recipes.json (default: <agent>/config/recipes.json,
  *                       fallback to <agent>/config/recipes.example.json when the
  *                       default is missing; an explicitly set RECIPES_PATH that
@@ -45,19 +52,23 @@ import {
 import { computeMemoryBudget } from "./catalog/memory.js";
 import { listServices } from "./catalog/services.js";
 import { createHttpServer } from "./http.js";
-import { collectTelemetry } from "./telemetry.js";
+import { collectTelemetry, AGENT_VERSION } from "./telemetry.js";
+import { parseLlmAuthTokens } from "./collectors/llm.js";
 
 // Catalog seam — re-exported so Worker 1A (telemetry) and 2A/2B (actions) can
 // import from agent/main.js or the catalog modules directly (same code).
 export { loadRecipes, getRecipe, listRecipes, validateRecipe, validateRecipeFile };
 export { computeMemoryBudget };
 export { listServices };
+export { parseLlmAuthTokens };
 
 const AGENT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_RECIPES = path.join(AGENT_DIR, "config", "recipes.json");
 const EXAMPLE_RECIPES = path.join(AGENT_DIR, "config", "recipes.example.json");
 
-export const AGENT_VERSION = "0.1.0";
+// AGENT_VERSION is defined in telemetry.js (single source of truth; the
+// snapshot and the HTTP identity both report it).
+export { AGENT_VERSION };
 
 /**
  * Parse a comma-separated port list into unique valid port numbers.
@@ -102,7 +113,7 @@ export function detectLanIp() {
 /**
  * Build the node identity from env vars.
  * @param {object} [env]
- * @returns {{nodeId: string, nodeName: string, lanIp: string, port: number, bind: string, token: string|null, llmPorts: number[], comfyPort: number|null}}
+ * @returns {{nodeId: string, nodeName: string, lanIp: string, port: number, bind: string, token: string|null, llmPorts: number[], comfyPort: number|null, llmAuthTokens: Record<string, string>, auditPath: string}}
  */
 export function readNodeIdentity(env = process.env) {
   const hostname = env.HOSTNAME || "unknown";
@@ -116,6 +127,10 @@ export function readNodeIdentity(env = process.env) {
     token: env.NODE_AGENT_TOKEN || null,
     llmPorts: parsePortList(env.LLM_PORTS || "8080"),
     comfyPort: comfyPort.length > 0 ? comfyPort[0] : null,
+    // "8080:<token>,8000:<token>" — per-port bearer tokens for LLM servers
+    // that gate their info endpoints behind an api-key (empty → {}).
+    llmAuthTokens: parseLlmAuthTokens(env.LLM_AUTH_TOKENS),
+    auditPath: env.NODE_AGENT_AUDIT_PATH || "",
   };
 }
 
@@ -177,12 +192,188 @@ export function resetCatalog() {
   _catalog = null;
 }
 
+// ── Snapshot enrichment (catalog join) ────────────────────────────────────
+
+/**
+ * Build the live port-state map that listServices joins against (keyed by
+ * port): what IS running on this node, from the collected pieces.
+ *
+ * Signals, in precedence order:
+ *  1. Docker container state for recipes with a containerName (running /
+ *     not-running — the authoritative "is the process up" for container
+ *     services).
+ *  2. systemd unit state for recipes with a systemdUnit.
+ *  3. Live LLM probes (backend != null → running, with modelId/engineVersion;
+ *     backend null with no other signal → stopped).
+ *  4. ComfyUI probe (port up → running, with version).
+ *
+ * A container reported running whose LLM probe failed (e.g. auth-gated or
+ * still loading) stays "running" — the probe only adds model info when it
+ * succeeds. No signal at all for a port → the recipe joins as "stopped".
+ *
+ * @param {object[]} recipes
+ * @param {{
+ *   containers?: object[],
+ *   systemdUnits?: object[],
+ *   llm?: object[],
+ *   comfy?: object | null
+ * }} live
+ * @returns {Record<string, object>} port → LivePortState (shared/types.ts)
+ */
+export function buildLiveState(recipes, live = {}) {
+  /** @type {Record<string, object>} */
+  const state = {};
+  const put = (port, partial) => {
+    if (typeof port !== "number" || !Number.isInteger(port)) return;
+    state[String(port)] = { ...(state[String(port)] || {}), ...partial };
+  };
+  const rs = Array.isArray(recipes) ? recipes : [];
+  const containers = Array.isArray(live.containers) ? live.containers : [];
+  const units = Array.isArray(live.systemdUnits) ? live.systemdUnits : [];
+  const llm = Array.isArray(live.llm) ? live.llm : [];
+
+  for (const r of rs) {
+    if (!r || typeof r !== "object") continue;
+    if (typeof r.containerName === "string" && r.containerName !== "") {
+      const c = containers.find((x) => x && x.name === r.containerName);
+      if (c && c.status === "running") put(r.port, { running: true });
+      else if (c) put(r.port, { running: false });
+    }
+    if (typeof r.systemdUnit === "string" && r.systemdUnit !== "") {
+      const u = units.find((x) => x && x.name === r.systemdUnit);
+      if (u && u.status === "running") put(r.port, { running: true });
+    }
+  }
+  for (const l of llm) {
+    if (!l || typeof l !== "object") continue;
+    if (l.backend != null) {
+      put(l.port, {
+        running: true,
+        status: "running",
+        modelId: typeof l.modelId === "string" && l.modelId !== "" ? l.modelId : null,
+        engineVersion: l.version != null ? String(l.version) : null,
+      });
+    } else if (!state[String(l.port)]) {
+      put(l.port, { running: false });
+    }
+  }
+  const comfy = live.comfy;
+  if (comfy && typeof comfy === "object" && comfy.port != null) {
+    put(comfy.port, {
+      running: true,
+      status: "running",
+      modelId: null,
+      engineVersion: comfy.version != null ? String(comfy.version) : null,
+    });
+  }
+  return state;
+}
+
+/**
+ * Enrich a collected NodeAgentSnapshot with the catalog-derived fields that
+ * assembleSnapshot leaves empty (services, memory, requests):
+ *
+ *  - services: listServices(recipes, liveState) — what CAN run joined with
+ *    what IS running.
+ *  - memory: computeMemoryBudget(mem.totalMB, mem.usedMB, services, 0, …) —
+ *    report-only: the agent reserves nothing on its own (wantMB 0), so the
+ *    panel shows total/used/free + per-service footprints; needMakeRoom is
+ *    false until an orchestrator asks for a reservation through the catalog
+ *    seam.
+ *  - requests: one RequestStat per live LLM probe (backend != null) plus the
+ *    ComfyUI probe, built from the probe's running/waiting counters and the
+ *    vLLM finished counter (vllm:request_success_total). No live engines →
+ *    null.
+ *
+ * Every section degrades to []/null on bad input — enrichment never breaks
+ * the snapshot the collectors already produced.
+ *
+ * @param {object} snapshot NodeAgentSnapshot from collectTelemetry
+ * @param {{ nodeId?: string, recipes?: object[] }} [opts]
+ * @returns {object} the snapshot with services/memory/requests populated
+ */
+export function enrichSnapshot(snapshot, opts = {}) {
+  if (!snapshot || typeof snapshot !== "object") return snapshot;
+  const nodeId = typeof opts.nodeId === "string" && opts.nodeId !== "" ? opts.nodeId : snapshot.nodeId;
+  const recipes = Array.isArray(opts.recipes) ? opts.recipes : [];
+  const snap = { ...snapshot };
+
+  const liveState = buildLiveState(recipes, {
+    containers: snap.containers,
+    systemdUnits: snap.systemd,
+    llm: snap.llm,
+    comfy: snap.comfy,
+  });
+
+  try {
+    snap.services = listServices(recipes, liveState);
+  } catch {
+    snap.services = [];
+  }
+
+  const mem = snap.mem;
+  if (mem && Number.isFinite(mem.totalMB) && Number.isFinite(mem.usedMB)) {
+    try {
+      snap.memory = computeMemoryBudget(
+        mem.totalMB,
+        mem.usedMB,
+        snap.services.map((s) => ({
+          name: s.name,
+          kind: s.kind,
+          footprintMB: s.footprintMB,
+          running: s.status === "running",
+          needed: s.active,
+        })),
+        0,
+        { nodeId }
+      );
+    } catch {
+      snap.memory = null;
+    }
+  }
+
+  /** @type {object[]} */
+  const stats = [];
+  for (const l of Array.isArray(snap.llm) ? snap.llm : []) {
+    if (!l || typeof l !== "object" || l.backend == null) continue;
+    if (typeof l.port !== "number" || !Number.isInteger(l.port)) continue;
+    stats.push({
+      modelId: typeof l.modelId === "string" && l.modelId !== "" ? l.modelId : "unknown",
+      engine: String(l.backend),
+      nodeId,
+      port: l.port,
+      queued: Number.isFinite(l.requestsWaiting) ? l.requestsWaiting : 0,
+      running: Number.isFinite(l.requestsRunning) ? l.requestsRunning : 0,
+      // SGLang exposes no finished counter today → 0 (documented limitation).
+      finished: Number.isFinite(l.requestsFinished) ? l.requestsFinished : 0,
+      polledAt: snap.polledAt,
+    });
+  }
+  const comfy = snap.comfy;
+  if (comfy && typeof comfy === "object" && Number.isInteger(comfy.port)) {
+    stats.push({
+      modelId: "comfyui",
+      engine: "comfyui",
+      nodeId,
+      port: comfy.port,
+      queued: Number.isFinite(comfy.queuePending) ? comfy.queuePending : 0,
+      running: Number.isFinite(comfy.queueRunning) ? comfy.queueRunning : 0,
+      finished: 0,
+      polledAt: snap.polledAt,
+    });
+  }
+  snap.requests = stats.length > 0 ? { nodeId, stats, polledAt: snap.polledAt } : null;
+
+  return snap;
+}
+
 /**
  * Build the node agent.
  *
- * Batch 1A + 1B: attaches the catalog seam (recipes, memory budgeting,
- * service registry) and the telemetry HTTP server (collectTelemetry over
- * agent/collectors/).
+ * Batch 1A + 1B + 2C: attaches the catalog seam (recipes, memory budgeting,
+ * service registry), the telemetry HTTP server (collectTelemetry over
+ * agent/collectors/), and the action layer (POST /actions, GET /audit) with
+ * snapshot enrichment (services/memory/requests joined from the catalog).
  * @param {object} [opts]
  * @returns {{
  *   identity: object,
@@ -209,11 +400,21 @@ export function createNodeAgent(opts = {}) {
         identity.nodeName,
         identity.lanIp,
         identity.llmPorts,
-        identity.comfyPort
-      ),
+        identity.comfyPort,
+        { llmAuthTokens: identity.llmAuthTokens }
+      ).then((snap) => enrichSnapshot(snap, { nodeId: identity.nodeId, recipes: catalog.recipes })),
     identity.port,
     identity.bind,
-    { agentVersion: AGENT_VERSION, token: identity.token }
+    {
+      agentVersion: AGENT_VERSION,
+      token: identity.token,
+      catalog: {
+        getRecipe: (name) => getRecipe(name, catalog.recipeFile),
+        listRecipes: () => listRecipes(catalog.recipeFile),
+      },
+      auditPath: identity.auditPath,
+      llmAuthTokens: identity.llmAuthTokens,
+    }
   );
   return {
     identity,

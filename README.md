@@ -239,11 +239,11 @@ The dashboard can also aggregate a **node-agent fleet**: each DGX Spark (or any 
 
 - `GET /api/fleet` — aggregated fleet snapshot (nodes, topology, requests, memory)
 - `POST / PUT / DELETE /api/fleet/nodes[/:id]` — registry CRUD, persisted to `config/nodes.json`
-- `POST /api/fleet/nodes/:id/actions` — service start/stop/switch proxied to the node agent (requires an agent build that ships the `POST /actions` endpoint; telemetry-only agent builds get a clear 501 back)
+- `POST /api/fleet/nodes/:id/actions` — service start/stop/restart/switch proxied to the node agent's `POST /actions` (agent ≥0.2.0; telemetry-only agent builds get a clear 501 back)
 
 New UI views (reachable from the header tabs): `/fleet` (fleet overview), `/topology` (RoCE topology diagram), `/node/:id` (node detail), `/node/:id/services` (service manager), `/node/:id/requests` (requests visualization).
 
-The node agent is installed on each Spark with `deploy/install-node-agent.sh` (Docker: `deploy/Dockerfile.node-agent`). The fleet layer is fully independent of the SSH-based Spark monitors above — both coexist.
+The node agent is installed on each Spark with `deploy/install-node-agent.sh` (Docker: `deploy/Dockerfile.node-agent`). The actions build (agent ≥0.2.0) ships `POST /actions` + `GET /audit`, and joins `services`/`memory`/`requests` into the telemetry snapshot; it needs host access (docker socket, `systemctl`, `nvidia-smi`, GPU devices) — the install script wires the mounts automatically (see `docs/NODE-AGENT.md`). The fleet layer is fully independent of the SSH-based Spark monitors above — both coexist.
 
 ---
 

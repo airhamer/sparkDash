@@ -7,6 +7,28 @@
 #
 # Build from the repo root:
 #   docker build -t airhamer/sparkdash-node-agent:latest -f deploy/Dockerfile.node-agent .
+#
+# ── Host access (actions build, ≥0.2.0) ───────────────────────────────────
+# The agent is a host-privileged LOCAL daemon: it shells out to the host's
+# docker / systemctl / nvidia-smi binaries and must read host devices.
+# deploy/install-node-agent.sh (or an equivalent `docker run`) must provide:
+#
+#   --network host
+#   -v <config-dir>:/app/agent/config      recipes + audit log (persisted)
+#   -v /var/run/docker.sock:/var/run/docker.sock
+#   -v /usr/bin/docker:/usr/bin/docker:ro
+#   -v /usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro
+#   -v /usr/bin/systemctl:/usr/bin/systemctl:ro
+#   -v /run/systemd:/run/systemd           systemctl's private socket (0700 root)
+#   --device /dev/nvidiactl  --device /dev/nvidia0   (all /dev/nvidia* present)
+#
+# The container therefore runs as ROOT on purpose: /run/systemd/private is
+# srwx------ root, so systemd actions (start/stop/restart + unit telemetry)
+# are impossible as any non-root user. Combined with the docker socket, the
+# container holds host-level control by design — that is the point of the
+# fleet actions layer. The security boundary is the HTTP surface: bind the
+# agent to the trusted LAN and set NODE_AGENT_TOKEN (bearer auth on all
+# data + action endpoints).
 
 # ── Stage 1: builder — install production deps ─────────────────────────────
 FROM node:18-slim AS builder
@@ -22,6 +44,6 @@ COPY --from=builder /app ./
 # Documented only; the container runs under network_mode: host (see
 # deploy/docker-compose.yml / install script), so this does not bind a port.
 EXPOSE 30091
-# Non-root so a misbehaving action handler can't trivially write host config.
-USER node
+# Root on purpose — see "Host access" above. Do not add USER back without
+# reworking the host-control mounts (systemd private socket requires root).
 CMD ["node", "agent/main.js"]

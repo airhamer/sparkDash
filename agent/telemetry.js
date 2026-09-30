@@ -27,7 +27,7 @@ import { collectLlm } from "./collectors/llm.js";
 import { collectComfy } from "./collectors/comfy.js";
 import { readTextFile, parseUptimeSeconds } from "./collectors/util.js";
 
-export const AGENT_VERSION = "0.1.0";
+export const AGENT_VERSION = "0.2.0";
 
 /**
  * Derive quantization from a model id/path reference.
@@ -152,9 +152,11 @@ export function assembleSnapshot({
  * @param {string} lanIp
  * @param {number[] | string} ports LLM server ports to probe
  * @param {number | null} comfyPort ComfyUI port (null/0 = skip)
- * @param {{ now?: () => number, readFile?: (path: string) => Promise<string>, inject?: object }} [opts]
+ * @param {{ now?: () => number, readFile?: (path: string) => Promise<string>, inject?: object, llmAuthTokens?: Record<string, string> }} [opts]
  *   `inject` maps collector names to override fns (test hook):
  *   gpu/cpu/mem/disk/net/docker/systemd/uptime → () => result; llm → (ports) => result; comfy → (port) => result.
+ *   `llmAuthTokens` (Record<"port", token>) adds per-port bearer auth to the
+ *   LLM probes for servers that gate their info endpoints behind an api-key.
  * @returns {Promise<object>} NodeAgentSnapshot
  */
 export async function collectTelemetry(nodeId, nodeName, lanIp, ports = [], comfyPort = null, opts = {}) {
@@ -180,7 +182,7 @@ export async function collectTelemetry(nodeId, nodeName, lanIp, ports = [], comf
     inj.net ? inj.net() : collectNet(opts),
     inj.docker ? inj.docker() : collectDocker(opts),
     inj.systemd ? inj.systemd() : collectSystemd(opts),
-    inj.llm ? inj.llm(ports) : collectLlm(ports, opts),
+    inj.llm ? inj.llm(ports) : collectLlm(ports, { authTokens: opts.llmAuthTokens }),
     inj.comfy ? inj.comfy(comfyPort) : collectComfy(comfyPort, opts),
   ]);
 

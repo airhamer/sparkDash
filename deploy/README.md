@@ -26,8 +26,14 @@ On each DGX Spark (from a checkout of the repo):
 - Builds `airhamer/sparkdash-node-agent:latest`
 - Writes `~/sparkdash-node-agent/config/recipes.json` (from `recipes.example.json`;
   never overwrites an existing file)
-- Starts the `sparkdash-node-agent` container on host networking
-- Verifies `curl http://127.0.0.1:30091/health` → `{"ok":true,...}`
+- Starts the `sparkdash-node-agent` container on host networking **with host
+  access for the actions build** (docker socket, host `docker`/`nvidia-smi`/
+  `systemctl` binaries, `/run/systemd`, all `/dev/nvidia*` devices — the
+  container runs as root, by design, see `Dockerfile.node-agent`)
+- Reads an optional host-side `~/sparkdash-node-agent/agent.env` (keep `0600`)
+  for `LLM_AUTH_TOKENS`, `NODE_AGENT_TOKEN`, and other agent env vars
+- Verifies `curl http://127.0.0.1:30091/health` → `{"ok":true,...}` and warns
+  if `/telemetry` reports `gpu: null` or no containers
 
 **Idempotent** — re-running removes and re-creates the container.
 
@@ -84,6 +90,7 @@ curl -s http://<dashboard-host>:5555/api/fleet | python3 -m json.tool | head
 |---|---|
 | Node registry (dashboard) | `config/nodes.json` ← `NODES_JSON_PATH` (in-container `/app/config/nodes.json`) |
 | Recipe catalog (node agent) | `config/recipes.json` per node ← `RECIPES_PATH` (in-container `/app/agent/config/recipes.json`) |
+| Per-node agent env (tokens etc.) | `~/sparkdash-node-agent/agent.env` on each node (host-side, not mounted) |
 | Auth tokens | `SPARKDASH_TOKEN` (dashboard), `NODE_AGENT_TOKEN` (agent) — see `.env.example` |
 
 Full env-var reference: `docs/DEPLOYMENT.md` → *Configuration*.

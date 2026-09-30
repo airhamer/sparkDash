@@ -78,6 +78,20 @@ and starts the `sparkdash-node-agent` container on host networking. **Idempotent
 — re-running removes and re-creates the container, and never overwrites an
 existing `recipes.json`. See [`deploy/install-node-agent.sh`](../deploy/install-node-agent.sh).
 
+**Host access (agent ≥0.2.0, actions build).** The agent shells out to the
+host's `docker`, `systemctl`, and `nvidia-smi`, so the container mounts:
+the docker socket + host `docker`/`nvidia-smi`/`systemctl` binaries,
+`/run/systemd` (systemctl's private socket is `srwx------ root`, which is why
+the container runs as root), and every `/dev/nvidia*` device. `/proc` and
+`/sys` are host-visible by default. `deploy/install-node-agent.sh` detects
+the GPU devices and wires all of this automatically; a hand-rolled
+`docker run` needs the equivalent flags (full list in
+[`deploy/Dockerfile.node-agent`](../deploy/Dockerfile.node-agent)).
+
+Without these mounts the agent still boots and reports what it can reach:
+`gpu: null`, `containers: []`, empty systemd services, and no action
+capability — degraded, not broken.
+
 ### B. docker-compose
 
 ```bash
@@ -118,6 +132,8 @@ All configuration is by environment variable (see
 | `NODE_LAN_IP` | first non-loopback IPv4 | LAN IP reported in snapshots. |
 | `LLM_PORTS` | `8080` | Comma-separated LLM server ports to probe for live versions/requests. |
 | `NODE_COMFY_PORT` | `8188` | ComfyUI port; `0` disables the probe. |
+| `LLM_AUTH_TOKENS` | *(unset)* | `port:token,port:token` — per-port bearer tokens for LLM servers that gate their info endpoints behind an api-key (sglang `--api-key`, vLLM `--api-key`). Without it, a gated port probes as `backend: null` and the service still shows as running via its docker container state. |
+| `NODE_AGENT_AUDIT_PATH` | `<agent>/config/audit.log` | Where `appendAudit`/`/audit` read the JSONL audit log. |
 | `RECIPES_PATH` | `<agent>/config/recipes.json` | Path to the recipe file (see below). |
 
 ### Recipe file resolution
@@ -140,16 +156,15 @@ All endpoints are JSON. With `NODE_AGENT_TOKEN` set, send
 
 | Endpoint | Method | Returns |
 |---|---|---|
-| `/telemetry` | GET | A full `NodeAgentSnapshot` (the primary data structure the dashboard polls). |
+| `/telemetry` | GET | A full `NodeAgentSnapshot` (the primary data structure the dashboard polls). `services` (recipes joined with live state), `memory` (budget, report-only `wantMB: 0`), and `requests` (per-engine queued/running/finished) are **fields of this snapshot**, not separate routes. `topology` is registry-owned (dashboard side). |
 | `/versions` | GET | Live `VersionInfo[]` — the *actual* running config (image tag/digest + LLM `server_info` + process env), not a recipe. |
 | `/containers` | GET | `ContainerInfo[]` — running (and, when requested, stopped) Docker containers. |
-| `/services` | GET | `ServiceInstance[]` — recipes joined with live state. |
-| `/memory` | GET | `MemoryBudget` — total/used/free + make-room plan. |
-| `/requests` | GET | `RequestStats` — queued/running/finished by model/engine/port. |
-| `/topology` | GET | `TopologyInfo` — role/rank/groupId/headId + this node's RoCE links. |
 | `/actions` | POST | Execute an `ActionRequest`; returns `ActionResponse`. |
-| `/audit` | GET | `AuditEntry[]` — recent action history. |
+| `/audit` | GET | `AuditEntry[]` — recent action history (`?limit=N`, default 50, capped 1000; `limit=0` → `[]`). |
 | `/health` | GET | `{"ok":true, ...}` liveness probe. |
+
+`/` returns the agent identity + endpoint list; it stays open (no token),
+as does `/health`.
 
 The canonical shapes are pinned in
 [`shared/api.schema.json`](../shared/api.schema.json)
@@ -185,8 +200,28 @@ right backend:
   on a port (stop old, start new with the requested model/context/memFraction).
 
 The response is an `ActionResponse` (`status`, `ok`, `message`, `error`,
-`durationMs`, `at`). Every action is appended to the audit log, visible at
-`/audit`.
+`durationMs`, `at`). The HTTP status is 200 for every *executed* action —
+including a failed one (`ok: false` is data, not an error); 400/404 cover
+validation and unknown-service errors, 503 is returned for `switch` when the
+live telemetry needed to find the old LLM is unavailable.
+
+- **Docker** (`agent/actions/docker.js`) — start/stop/restart a container named
+  in the recipe (`containerName`), exact-argv, no shell.
+- **systemd** (`agent/actions/systemd.js`) — for services managed by a unit
+  (`systemdUnit` in the recipe) instead of Docker. A recipe with neither
+  `containerName` nor `systemdUnit` is not actionable (400).
+- **LLM switch** (`agent/actions/llm-switch.js`) — start the requested service
+  (its recipe's container/unit, port = `request.port` ?? recipe port), first
+  stopping the LLM that is *currently running* on this node — discovered from
+  the live snapshot (`versions`, `state: "running"`, port ≠ target) and
+  resolved back through the recipe catalog. No other running LLM → the stop
+  step is skipped. The new port is then canary-probed (`/health`, then
+  `/get_server_info`); per-port `LLM_AUTH_TOKENS` are applied to the canary
+  when the server gates its info endpoints. `running` in the response means
+  the container/unit started but the canary was still loading within budget.
+
+Every executed action is appended to the audit log, readable via
+`GET /audit?limit=N`.
 
 ---
 

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { collectLlm, normalizeModelId } from "../llm.js";
+import { collectLlm, normalizeModelId, parseLlmAuthTokens } from "../llm.js";
 
 function http(status, body) {
   return {
@@ -15,6 +15,8 @@ const VLLM_METRICS = [
   "vllm:kv_cache_usage_perc 0.42",
   "vllm:num_requests_running 1",
   "vllm:num_requests_waiting 0",
+  "vllm:request_success_total{engine=\"0\",finished_reason=\"stop\"} 5",
+  "vllm:request_success_total{engine=\"0\",finished_reason=\"length\"} 2",
   "vllm:num_preemptions_total 3",
   "vllm:prefix_cache_hits_total 100",
   "vllm:prefix_cache_queries_total 200",
@@ -69,6 +71,7 @@ test("llm: detects vllm and parses /metrics tiles (ground truth)", async () => {
   assert.equal(l.kvCacheUsage, 0.42);
   assert.equal(l.requestsRunning, 1);
   assert.equal(l.requestsWaiting, 0);
+  assert.equal(l.requestsFinished, 7); // 5 + 2 across finished_reason labels
   assert.equal(l.preemptionsTotal, 3);
   assert.equal(l.prefixCacheHitRate, 0.5); // 100/200
   assert.equal(l.ttftP95Seconds, 1.0); // p95 of histogram {0.5:40, 1.0:95, Inf:100}, n=100
@@ -143,4 +146,55 @@ test("llm: port list normalization dedupes + validates", async () => {
   const { normalizeLlmPorts } = await import("../llm.js");
   assert.deepEqual(normalizeLlmPorts("8080, 8080,8081"), [8080, 8081]);
   assert.deepEqual(normalizeLlmPorts([8080, "8081"]), [8080, 8081]);
+});
+
+test("llm: authTokens add a bearer header only for the configured port", async () => {
+  /** @type {Array<{url: string, headers?: any}>} */
+  const seen = [];
+  const fetchSpy = async (url, init) => {
+    seen.push({ url, headers: init?.headers ?? null });
+    if (url === "http://127.0.0.1:8081/get_server_info") {
+      return http(200, JSON.stringify({ model_path: "/models/m", version: "0.5.19" }));
+    }
+    if (url === "http://127.0.0.1:8080/get_server_info") {
+      // unauthenticated would 401 here; with the header it succeeds
+      const auth = init?.headers?.Authorization;
+      if (auth !== "Bearer sekret-8080") return http(401, JSON.stringify({ error: "Unauthorized" }));
+      return http(200, JSON.stringify({ model_path: "/models/m", version: "0.5.19" }));
+    }
+    throw new Error("unexpected url: " + url);
+  };
+  const out = await collectLlm([8080, 8081], { fetch: fetchSpy, authTokens: { "8080": "sekret-8080" } });
+  assert.equal(out[0].backend, "sglang"); // 8080 succeeded with auth
+  assert.equal(out[1].backend, "sglang"); // 8081 needed no auth
+  const h8080 = seen.find((s) => s.url.includes(":8080/"))?.headers;
+  assert.equal(h8080?.Authorization, "Bearer sekret-8080");
+  const h8081 = seen.find((s) => s.url.includes(":8081/"))?.headers;
+  assert.ok(h8081 == null || typeof h8081 === "object" && !("Authorization" in h8081), "no header for unconfigured port");
+});
+
+test("llm: authTokens 401 without the token → backend null (graceful)", async () => {
+  const out = await collectLlm([8080], {
+    fetch: async (url) => {
+      if (url === "http://127.0.0.1:8080/get_server_info") {
+        return http(401, JSON.stringify({ error: "Unauthorized" }));
+      }
+      if (url === "http://127.0.0.1:8080/v1/models") {
+        return http(401, JSON.stringify({ error: "Unauthorized" }));
+      }
+      throw new Error("unexpected url: " + url);
+    },
+    // no authTokens → the gated endpoints stay 401 → no backend detected
+  });
+  assert.equal(out[0].backend, null);
+});
+
+test("llm: parseLlmAuthTokens parses port:token lists, skips malformed parts", () => {
+  assert.deepEqual(parseLlmAuthTokens("8080:abc, 8000: xyz "), {
+    "8080": "abc",
+    "8000": "xyz",
+  });
+  assert.deepEqual(parseLlmAuthTokens(""), {});
+  assert.deepEqual(parseLlmAuthTokens(null), {});
+  assert.deepEqual(parseLlmAuthTokens("garbage,99999:nope,8080:tok"), { "8080": "tok" });
 });

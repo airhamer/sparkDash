@@ -10,6 +10,12 @@ Format: version sections are listed newest first.
 ## [Unreleased]
 
 ### Added
+
+- **Node agent: actions + audit over HTTP (agent 0.2.0)** — `POST /actions` executes `ActionRequest`s (start/stop/restart via the recipe's docker container or systemd unit; switch stops the currently running LLM, starts the target, canary-probes it) and `GET /audit?limit=N` serves the JSONL audit log. Both are token-authenticated like `/telemetry`; the dashboard's `POST /api/fleet/nodes/:id/actions` proxy now reaches a live endpoint (501 only on telemetry-only builds).
+- **Node agent: full telemetry snapshot** — `/telemetry` now joins the recipe catalog into the snapshot: `services` (recipes × live container/unit/LLM/ComfyUI state), `memory` (report-only budget, `wantMB: 0`; the active LLM is marked `needed`), and `requests` (per-engine queued/running/finished — vLLM finished from `vllm:request_success_total`).
+- **Node agent: LLM probe auth** — `LLM_AUTH_TOKENS="port:token,..."` adds per-port `Authorization: Bearer` headers to LLM probes and the switch canary, for servers run with `--api-key` (sglang/vLLM). Unauthenticated gated ports degrade to container-state-only visibility instead of erroring.
+- **Node agent: host-access install** — `deploy/install-node-agent.sh` now mounts the docker socket + host `docker`/`nvidia-smi`/`systemctl` binaries, `/run/systemd` (root-only private socket ⇒ container runs as root, documented in `deploy/Dockerfile.node-agent`), and all `/dev/nvidia*` devices, and reads an optional host-side `~/sparkdash-node-agent/agent.env` (kept out of the repo and the container filesystem). Post-start checks warn when `gpu` or `containers` come back empty.
+
 - **Custom prefill size** — type any token count from 256–300k in the prefill benchmark (plus the preset chips).
 - **q27 LLM backend** — detect signalnine/q27 via `/v1/models` ownership or `q27_*` Prometheus series; report backend-aware decode/prefill rates and inference-health telemetry.
 - **Hide worker nodes** — Settings toggle. Worker-role Sparks drop off Overview cards and the tab bar (the open worker tab stays). Direct URLs and batch Wake / Shutdown / Hermes still include them.
@@ -18,6 +24,9 @@ Format: version sections are listed newest first.
 - **Benchmark share image** — the decode/prefill **Copy results** button is now a split button: the label copies the text summary as before, and the caret on its right offers **Copy as text** / **Copy as image** on hover or click. The image is a 1200×675-or-taller card drawn in the app's dark palette with the sparkDash mark, the unit, the model, one row per level and the same legend the dialog shows. On by default (Settings → **Benchmark share image** turns it off, restoring the plain text button); it copies where the page has an image clipboard — HTTPS or localhost — and otherwise downloads the PNG, and says so in the menu rather than pretending.
 
 ### Fixed
+
+- **Fleet-energy split test time bomb** — the "splits energy and coverage at UTC minute boundaries" integration test used fixed 2026-08-23 fixtures while `flush()` prunes against the wall clock, so it started failing after 2026-09-23 (31-day retention). The test now pins the tracker's `now` seam.
+
 - **Decode bench “Too many benchmark requests”** — start quota was 6/min stacked with a 2/min cooldown, and failed retries still burned the quota. Starts are now 20/min, cooldown is 3s (double-click only), and 400/409 responses do not count.
 - **Decode bench 24×/32× work budget ([#93](https://github.com/MiaAI-Lab/sparkDash/issues/93))** — the post-1.8.6 security cap (131k total tokens) rejected a full concurrency sweep at 2048 max tokens. The cap is 262k so every advertised level fits.
 - **Prefill bench still dying at ~5 min** — Node undici aborts streams with no headers/body after 300s. Long prefills now use an Agent with those idle timeouts disabled; the per-size AbortSignal remains the bound.
@@ -27,8 +36,11 @@ Format: version sections are listed newest first.
 - **SGLang served model ID ([#95](https://github.com/MiaAI-Lab/sparkDash/pull/95))** — the panel and the bench requests use the id from `/v1/models` (what the server accepts), keeping the native storage path on `modelPath`.
 - **Remote SSH session churn** — collectors reuse an authenticated SSH transport instead of creating a full SSH/PAM login for every metric poll. `SSH_CONTROL_PERSIST_SECONDS=0` restores one connection per command if needed.
 
----
+### Changed
 
+- **Docs corrected to match the real agent API** — `docs/NODE-AGENT.md` no longer lists `/services`, `/memory`, `/requests`, `/topology` as GET routes (they are `NodeAgentSnapshot` fields on `/telemetry`); `docs/DEPLOYMENT.md` and the README document the new mounts, env vars, and switch semantics.
+
+---
 ## [1.8.8] — 2026-09-22
 
 ### Fixed

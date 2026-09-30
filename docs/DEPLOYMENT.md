@@ -79,12 +79,22 @@ On each Spark, from a checkout of the repo:
 ```
 
 Idempotent. It builds `airhamer/sparkdash-node-agent:latest`, provisions
-`~/sparkdash-note-agent` → `~/sparkdash-node-agent/config/recipes.json`, starts
-the container on host networking, and verifies `/health`. Or via compose:
+`~/sparkdash-node-agent/config/recipes.json`, starts the container on host
+networking, and verifies `/health`. Or via compose:
 
 ```bash
 docker compose -f deploy/docker-compose.yml up -d node-agent
 ```
+
+**Host access (agent ≥0.2.0).** The actions build shells out to the host's
+`docker`/`systemctl`/`nvidia-smi`, so the install script mounts the docker
+socket, the three host binaries, `/run/systemd` (root-only private socket —
+the container runs as root), and all `/dev/nvidia*` devices. An optional
+host-side env file `~/sparkdash-node-agent/agent.env` (keep it `0600`) is
+read for `LLM_AUTH_TOKENS`, `NODE_AGENT_TOKEN`, and the other agent vars —
+secrets stay out of the repo and out of the container's filesystem. A node
+without these mounts still boots and reports `gpu: null`,
+`containers: []` (degraded telemetry-only behavior).
 
 Full node-agent details: [`docs/NODE-AGENT.md`](NODE-AGENT.md).
 
@@ -141,6 +151,10 @@ and [`.env.example`](../.env.example)):
 | `NODE_AGENT_TOKEN` | *(unset)* | Optional bearer token for the agent API. |
 | `NODE_ID` / `NODE_NAME` | hostname | Node identity (id must match the registry). |
 | `NODE_LAN_IP` | auto-detect | LAN IP reported in snapshots. |
+| `LLM_PORTS` | `8080` | Comma-separated LLM ports to probe for versions/requests. |
+| `NODE_COMFY_PORT` | `8188` | ComfyUI port (`0` disables). |
+| `LLM_AUTH_TOKENS` | *(unset)* | `port:token,...` bearer tokens for api-key-gated LLM servers (sglang/vLLM `--api-key`). |
+| `NODE_AGENT_AUDIT_PATH` | `/app/agent/config/audit.log` | Action audit log (JSONL, in the mounted config volume). |
 
 Copy [`.env.example`](../.env.example) to `.env` and adjust to taste.
 

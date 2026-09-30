@@ -629,6 +629,10 @@ test("integration splits energy and coverage at UTC minute boundaries", (t) => {
     load: false,
     setIntervalFn: () => 1,
     clearIntervalFn: () => {},
+    // Pin the clock just after the recorded samples: flush() prunes against
+    // _now(), and the fixed 2026-08-23 fixtures fall outside the 31-day
+    // retention window once the wall clock passes 2026-09-23 (time bomb).
+    now: () => minute + 120_000,
   });
 
   tracker.record([nodeSnapshot("node-a", { watts: 100 })], minute + 59_000);

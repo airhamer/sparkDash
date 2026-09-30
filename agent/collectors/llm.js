@@ -8,6 +8,11 @@
  *   1. GET /get_server_info            → sglang (native endpoint)
  *   2. GET /v1/models (OpenAI-compat)  → vllm (owned_by signal / /metrics)
  * Unreachable port → entry with backend: null (one entry per port).
+ *
+ * Auth: some LLM servers gate their info endpoints behind an api-key
+ * (sglang --api-key, vllm --api-key). Pass opts.authTokens as a
+ * Record<"port", token> and the probes for that port carry
+ * `Authorization: Bearer <token>` (no token configured → no header).
  */
 
 const TIMEOUT_MS = 1500;
@@ -64,6 +69,32 @@ export function normalizeLlmPorts(ports) {
   return out;
 }
 
+/**
+ * Parse per-port LLM auth tokens from the LLM_AUTH_TOKENS env value:
+ * "8080:<token>,8000:<token2>" → { "8080": "<token>", "8000": "<token2>" }.
+ * Malformed parts (bad port, empty token, missing colon) are skipped, never
+ * thrown on. Empty/missing input → {}.
+ * @param {string | null | undefined} raw
+ * @returns {Record<string, string>} port (string) → bearer token
+ */
+export function parseLlmAuthTokens(raw) {
+  /** @type {Record<string, string>} */
+  const out = {};
+  if (typeof raw !== "string" || raw.trim() === "") return out;
+  for (const part of raw.split(",")) {
+    const t = part.trim();
+    if (t === "") continue;
+    const i = t.indexOf(":");
+    if (i <= 0) continue;
+    const port = Number(t.slice(0, i).trim());
+    const token = t.slice(i + 1).trim();
+    if (Number.isInteger(port) && port >= 1 && port <= 65535 && token !== "") {
+      out[String(port)] = token;
+    }
+  }
+  return out;
+}
+
 /** @returns {Record<string, any>} */
 function defaultLlm(port) {
   return {
@@ -76,6 +107,7 @@ function defaultLlm(port) {
     gpuMemoryUtilization: null,
     requestsRunning: null,
     requestsWaiting: null,
+    requestsFinished: null,
     kvCacheUsage: null,
     preemptionsTotal: null,
     prefixCacheHitRate: null,
@@ -87,13 +119,29 @@ function defaultLlm(port) {
 }
 
 /**
+ * Per-port bearer headers, or null when the port has no token.
+ * @param {Record<string, string> | null | undefined} authTokens
+ * @param {number} port
+ * @returns {Record<string,string> | null}
+ */
+function portHeaders(authTokens, port) {
+  const token = authTokens && typeof authTokens === "object" ? authTokens[String(port)] : null;
+  if (typeof token !== "string" || token === "") return null;
+  return { Authorization: `Bearer ${token}` };
+}
+
+/**
  * Fetch a URL and parse JSON; null on any failure (incl. non-2xx).
  * @param {(url: string, opts?: object) => Promise<any>} fetchFn
  * @param {string} url
+ * @param {Record<string,string> | null} [headers]
  */
-async function fetchJson(fetchFn, url) {
+async function fetchJson(fetchFn, url, headers) {
   try {
-    const res = await fetchFn(url, { signal: AbortSignal.timeout(TIMEOUT_MS) });
+    const res = await fetchFn(url, {
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+      ...(headers ? { headers } : {}),
+    });
     if (!res.ok) return null;
     return await res.json().catch(() => null);
   } catch {
@@ -105,10 +153,14 @@ async function fetchJson(fetchFn, url) {
  * Fetch a URL as text; null on any failure (incl. non-2xx).
  * @param {(url: string, opts?: object) => Promise<any>} fetchFn
  * @param {string} url
+ * @param {Record<string,string> | null} [headers]
  */
-async function fetchText(fetchFn, url) {
+async function fetchText(fetchFn, url, headers) {
   try {
-    const res = await fetchFn(url, { signal: AbortSignal.timeout(TIMEOUT_MS) });
+    const res = await fetchFn(url, {
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+      ...(headers ? { headers } : {}),
+    });
     if (!res.ok) return null;
     return await res.text();
   } catch {
@@ -120,11 +172,12 @@ async function fetchText(fetchFn, url) {
  * SGLang load: /v1/loads preferred, /get_load fallback.
  * @param {(url: string, opts?: object) => Promise<any>} fetchFn
  * @param {string} base
+ * @param {Record<string,string> | null} [headers]
  * @returns {Promise<{running:number, waiting:number} | null>}
  */
-async function fetchSglangLoad(fetchFn, base) {
+async function fetchSglangLoad(fetchFn, base, headers) {
   for (const p of ["/v1/loads", "/get_load"]) {
-    const data = await fetchJson(fetchFn, `${base}${p}`);
+    const data = await fetchJson(fetchFn, `${base}${p}`, headers);
     if (data == null) continue;
     const rows = Array.isArray(data)
       ? data
@@ -260,6 +313,9 @@ function applyVllmMetrics(m, txt) {
   m.kvCacheUsage = getPromMetric(txt, "vllm:kv_cache_usage_perc");
   m.requestsRunning = getPromMetric(txt, "vllm:num_requests_running");
   m.requestsWaiting = getPromMetric(txt, "vllm:num_requests_waiting");
+  // Finished counter: vLLM's request_success_total (summed over all
+  // finished_reason label sets — completed + aborted + errored requests).
+  m.requestsFinished = getPromMetric(txt, "vllm:request_success_total");
   m.preemptionsTotal = getPromMetric(txt, "vllm:num_preemptions_total");
   const hits = getPromMetric(txt, "vllm:prefix_cache_hits_total");
   const queries = getPromMetric(txt, "vllm:prefix_cache_queries_total");
@@ -318,28 +374,28 @@ function applyVllmModel(m, model) {
  * @param {(url: string, opts?: object) => Promise<any>} fetchFn
  * @returns {Promise<Record<string, any>>}
  */
-async function probePort(port, fetchFn) {
+async function probePort(port, fetchFn, headers) {
   const base = `http://127.0.0.1:${port}`;
   const m = defaultLlm(port);
   try {
     // 1. SGLang native endpoint
-    const sg = await fetchJson(fetchFn, `${base}/get_server_info`);
+    const sg = await fetchJson(fetchFn, `${base}/get_server_info`, headers);
     if (sg && typeof sg === "object" && !Array.isArray(sg)) {
       m.backend = "sglang";
       applySglangInfo(m, sg);
-      const load = await fetchSglangLoad(fetchFn, base);
+      const load = await fetchSglangLoad(fetchFn, base, headers);
       m.requestsRunning = load?.running ?? null;
       m.requestsWaiting = load?.waiting ?? null;
       return m;
     }
 
     // 2. OpenAI-compatible (vLLM)
-    const models = await fetchJson(fetchFn, `${base}/v1/models`);
+    const models = await fetchJson(fetchFn, `${base}/v1/models`, headers);
     const model = models?.data?.[0];
     if (model && typeof model === "object") {
       m.backend = "vllm";
       applyVllmModel(m, model);
-      const txt = await fetchText(fetchFn, `${base}/metrics`);
+      const txt = await fetchText(fetchFn, `${base}/metrics`, headers);
       if (txt) applyVllmMetrics(m, txt);
       return m;
     }
@@ -353,11 +409,14 @@ async function probePort(port, fetchFn) {
 /**
  * Probe LLM servers over HTTP.
  * @param {number | string | Array<number | string>} ports
- * @param {{ fetch?: (url: string, opts?: object) => Promise<any> }} [opts]
+ * @param {{
+ *   fetch?: (url: string, opts?: object) => Promise<any>,
+ *   authTokens?: Record<string, string>
+ * }} [opts]
  * @returns {Promise<Array<Record<string, any>>>} one entry per port; [] when no valid port
  */
-export async function collectLlm(ports, { fetch: fetchFn = fetch } = {}) {
+export async function collectLlm(ports, { fetch: fetchFn = fetch, authTokens = null } = {}) {
   const portList = normalizeLlmPorts(ports);
   if (portList.length === 0) return [];
-  return Promise.all(portList.map((port) => probePort(port, fetchFn)));
+  return Promise.all(portList.map((port) => probePort(port, fetchFn, portHeaders(authTokens, port))));
 }
